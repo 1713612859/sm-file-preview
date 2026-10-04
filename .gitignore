@@ -1,0 +1,12 @@
+# Maven 构建产物（可重新生成）
+target/
+
+# 审查报告产物：审查对象可能是真实业务项目，内容不入库；基准样本用 fixture/（脱敏）。
+out/
+
+# IDE
+.idea/
+*.iml
+
+# ZCode 会话目录
+.zcode/
