@@ -1,5 +1,11 @@
 # sm-file-review — SM 文件审查工具
 
+> **本仓库当前有两条工具线：**
+> 1. **SM SIA 认证验收线(2026-10 起主用)**:`sia_validator.py`(44 条规则验收闸门)、
+>    `sia_generator.py`(EJ 版式参考生成器)、`sia_recompute.py`(逐笔重算对拍)、
+>    `sia_common.py`(公共库)。先读 `00_包内导览_先看这里.md`。
+> 2. js/Java 源码静态审查线(下文所述,Node/Java 双实现交叉验证)。
+
 面向 **js 脚本**（.js/.mjs/.cjs/.ts/.jsx/.tsx）与 **Java 项目**（.java + pom.xml）的
 静态文件审查工具链。规则表 **Node / Java 双实现交叉验证**（沿袭 ej-render-test 的
 「同一套口径、两种实现、结论必须一致」范式）。

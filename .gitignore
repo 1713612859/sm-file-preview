@@ -10,3 +10,7 @@ out/
 
 # ZCode 会话目录
 .zcode/
+
+# Python 运行产物
+__pycache__/
+*.pyc
