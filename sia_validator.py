@@ -95,6 +95,34 @@ class Findings:
 
 
 # --------------------------------------------------------------------------
+# 日期语义校验:格式正则 + 日历存在性双验
+# --------------------------------------------------------------------------
+def valid_date(s: str) -> bool:
+    """格式与日历均合法才返回 True。实测依据(2026-10-11 评审复现,Python 3.13):
+    2026-02-30 / 2026-13-01 能过 DATE_RX,但 date.fromisoformat 抛 ValueError——
+    只查格式会让 F06 漏报、V08 的 fromisoformat 未捕获直接崩溃。"""
+    if not DATE_RX.match(s):
+        return False
+    try:
+        date.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
+def valid_dt(s: str) -> bool:
+    """同 valid_date,面向日期时间列(Check Open/Close):
+    2026-01-01 25:00:00 之类格式合法但日历/时钟非法的值同样要拦。"""
+    if not DT_RX.match(s):
+        return False
+    try:
+        datetime.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
+# --------------------------------------------------------------------------
 # 证据件校验(ORs/ 与 ZReads/)
 # --------------------------------------------------------------------------
 def check_evidence(root: Path, tx_by_order: dict, ix: dict, findings: Findings, tol: float):
@@ -102,11 +130,16 @@ def check_evidence(root: Path, tx_by_order: dict, ix: dict, findings: Findings, 
 
     if or_dir.is_dir():
         files = sorted(or_dir.iterdir())
+        # 2026-10-11 定案(用户指示):APOS-SM 票据文件用 *_T1_Si_单号 命名(Si=Sales
+        # Invoice),按可接受口径处理,OR/Si 两种标识都认;金样例仍为 *_OR_单号。
         covered = {str(int(m.group(1))) for m in
-                   (re.search(r"OR[_-]?(\d+)", f.name) for f in files) if m}
+                   (re.search(r"(?:\b|[_-])(?:OR|SI)[_-]?(\d+)", f.name, re.I)
+                    for f in files) if m}
         for o in tx_by_order:
             if o not in covered and o.lstrip("0") not in covered:
-                findings.add("E01", "ORs/", order=o, expected=f"存在 *_OR_{o}.* 收据",
+                # 命名口径同上方 covered 正则:OR/Si 双标识(2026-10-11 定案)
+                findings.add("E01", "ORs/", order=o,
+                             expected=f"存在 *_OR_{o}.* 或 *_T1_Si_{o}.* 收据",
                              actual="未找到(命名不规则或缺失)")
         _check_or_content(files, tx_by_order, findings, tol)
         txt_stems = {f.stem for f in files if f.suffix.lower() == ".txt"}
@@ -122,22 +155,28 @@ def check_evidence(root: Path, tx_by_order: dict, ix: dict, findings: Findings, 
             m = re.search(r"(\d{4}-\d{2}-\d{2})", f.name)
             if m:
                 days.setdefault(m.group(1), []).append(f)
-        for o, (_ln, r, _ix, _v, _p) in tx_by_order.items():
-            bd = r[ix["Business Day"]]
-            if bd not in days:
-                findings.add("E02", "ZReads/", order=o, expected=f"存在 {bd} 的 Z-Reading", actual="缺失")
-        _check_zread_content(days, tx_by_order, ix, findings, tol)
+        # 表头缺列时跳过按日聚合(缺列已由 F03 报 ERROR,此处不应崩溃)
+        if "Business Day" in ix:
+            for o, (_ln, r, _ix, _v, _p) in tx_by_order.items():
+                bd = r[ix["Business Day"]]
+                if bd not in days:
+                    findings.add("E02", "ZReads/", order=o, expected=f"存在 {bd} 的 Z-Reading", actual="缺失")
+        if all(c in ix for c in ("Business Day", "Void", "Refund")):
+            _check_zread_content(days, tx_by_order, ix, findings, tol)
     else:
         findings.add("E02", str(root), detail="无 ZReads/ 目录")
 
 
 def _check_or_content(files, tx_by_order, findings, tol):
+    # 订单号可能带前导零(APOS-SM 为 16 位),按去零归一键匹配,否则内容校验静默跳过;
+    # 金样例短单号("1"/"2"...)不受影响。命名同 E01:OR/Si 双标识(2026-10-11 定案)。
+    tx_by_int = {k.lstrip("0"): v for k, v in tx_by_order.items()}
     for f in files:
         if f.suffix.lower() != ".txt":
             continue
-        m = re.search(r"OR[_-]?(\d+)", f.name)
+        m = re.search(r"(?:\b|[_-])(?:OR|SI)[_-]?(\d+)", f.name, re.I)
         key = str(int(m.group(1))) if m else None
-        t = tx_by_order.get(key) or (tx_by_order.get(key.lstrip("0")) if key else None)
+        t = tx_by_int.get(key) if key else None
         if not t:
             continue
         _ln, _r, _ix, vals, psum = t
@@ -376,25 +415,27 @@ def main():
             if pt and not ALNUM.match(pt):
                 findings.add("V02", tx_name, line=ln, order=o, column=f"Payment Type_{k}",
                              expected="仅字母数字(样例代码:CSH/CCMASTERCRD/DCVISA/GIFTCHEQUE/GCASH/MALLPAYxx)", actual=pt)
-        if not DATE_RX.match(get("Business Day")):
+        if not valid_date(get("Business Day")):
             findings.add("F06", tx_name, line=ln, order=o, column="Business Day", actual=get("Business Day"))
         for c in ("Check Open", "Check Close"):
-            if not DT_RX.match(get(c)):
+            if not valid_dt(get(c)):
                 findings.add("F06", tx_name, line=ln, order=o, column=c, actual=get(c))
-        if all(DT_RX.match(get(c)) for c in ("Check Open", "Check Close")):
+        if all(valid_dt(get(c)) for c in ("Check Open", "Check Close")):
             t_open = datetime.fromisoformat(get("Check Open"))
             t_close = datetime.fromisoformat(get("Check Close"))
             if t_open > t_close:
                 findings.add("V09", tx_name, line=ln, order=o, expected="Check Open ≤ Check Close",
                              actual=f"{get('Check Open')} > {get('Check Close')}")
-            bd = date.fromisoformat(get("Business Day"))
-            close_d = t_close.date()
-            if bd == close_d - timedelta(days=1) and t_close.hour >= 6:
-                findings.add("V08", tx_name, line=ln, order=o, column="Business Day",
-                             expected="非凌晨结单应归 Check Close 当天", actual=f"BD={bd} close={t_close}")
-            elif bd not in (close_d, close_d - timedelta(days=1)):
-                findings.add("V08", tx_name, line=ln, order=o, column="Business Day",
-                             expected=f"= {close_d}(或凌晨结单前一天)", actual=str(bd))
+            bd_s = get("Business Day")
+            if valid_date(bd_s):  # 坏/缺/日历不存在的营业日已由 F06 报告,此处只对合法日期做归属判定
+                bd = date.fromisoformat(bd_s)
+                close_d = t_close.date()
+                if bd == close_d - timedelta(days=1) and t_close.hour >= 6:
+                    findings.add("V08", tx_name, line=ln, order=o, column="Business Day",
+                                 expected="非凌晨结单应归 Check Close 当天", actual=f"BD={bd} close={t_close}")
+                elif bd not in (close_d, close_d - timedelta(days=1)):
+                    findings.add("V08", tx_name, line=ln, order=o, column="Business Day",
+                                 expected=f"= {close_d}(或凌晨结单前一天)", actual=str(bd))
         for c in TX_HEADER:
             if c not in TX_NULLABLE and get(c) == "":
                 findings.add("V03", tx_name, line=ln, order=o, column=c, expected="非空(该列不可空)", actual='""')
@@ -535,7 +576,8 @@ def main():
     # A09:退款可对应历史正单
     pos_gross = {round(v, 2) for v in pos_gross_amounts}
     for o, (ln, r, ix_, vals, psum) in tx_by_order.items():
-        if r[ix_["Refund"]] == "1" or (vals["Refund Amount"] != 0 and vals["Gross Sales Amount"] < 0):
+        refund_flag = r[ix_["Refund"]] if "Refund" in ix_ else "0"
+        if refund_flag == "1" or (vals["Refund Amount"] != 0 and vals["Gross Sales Amount"] < 0):
             amt = abs(vals["Gross Sales Amount"])
             if not any(abs(amt - p) <= args.tol for p in pos_gross):
                 findings.add("A09", tx_name, line=ln, order=o,
@@ -552,7 +594,10 @@ def main():
                 findings.add("F08", tx_name, expected=f"营业日均属文件期号 {period}",
                              actual=f"{len(bad)} 天越期: {bad[:5]}")
             if days:
-                span = (date.fromisoformat(days[-1]) - date.fromisoformat(days[0])).days + 1
+                try:
+                    span = (date.fromisoformat(days[-1]) - date.fromisoformat(days[0])).days + 1
+                except ValueError:
+                    span = 0  # 营业日值格式坏已由 F06 报告
                 if span > 30:
                     findings.add("F08", tx_name, expected="30 天滚动窗口(今天−29 ~ 今天)",
                                  actual=f"数据跨度 {span} 天({days[0]}~{days[-1]})",
@@ -595,9 +640,12 @@ def main():
                     findings.add("D05", dt_name, line=ln, order=o, column=amt_col,
                                  expected=">0(明细作废/退款金额填正数)", actual=r[slots[amt_col]])
                 t = tx_by_order.get(o)
-                if t and t[1][t[2]["Void" if vflag == "1" else "Refund"]] != "1":
+                mcol = "Void" if vflag == "1" else "Refund"
+                # 主表缺 Void/Refund 列已由 F03 报 ERROR,次级检查不追加(与 A09 缺列默认
+                # "0"、E02 缺列跳过同口径,2026-10-11 评审);孤儿明细(t=None)由 D01 报
+                if t and mcol in t[2] and t[1][t[2][mcol]] != "1":
                     findings.add("D06", dt_name, line=ln, order=o, column="Void/Refund",
-                                 expected="主表对应交易 tag=1", actual=f"主表={t[1][t[2]['Void' if vflag == '1' else 'Refund']]}")
+                                 expected="主表对应交易 tag=1", actual=f"主表={t[1][t[2][mcol]]}")
 
         # 主↔明细覆盖 + 金额合计(D01/D02/D05)
         for o, (ln, r, ix_, vals, psum) in tx_by_order.items():
@@ -619,8 +667,10 @@ def main():
                              expected=f"明细 Σ(qty×成交价)={expect:.2f}(|Gross|−LocalTax−LessTax−Discount)",
                              actual=f"{total:.2f}",
                              detail="常见原因:折扣/免税/服务费未摊入商品成交价,或明细价格与主表脱节")
-            if r[ix_["Void"]] == "1" or r[ix_["Refund"]] == "1":
-                amt_col = "Void Amount" if r[ix_["Void"]] == "1" else "Refund Amount"
+            void_flag = r[ix_["Void"]] if "Void" in ix_ else "0"
+            refund_flag = r[ix_["Refund"]] if "Refund" in ix_ else "0"
+            if void_flag == "1" or refund_flag == "1":
+                amt_col = "Void Amount" if void_flag == "1" else "Refund Amount"
                 per_row = {money(dr[slots[amt_col]]) for _, dr in rows}
                 max_menu = max((money(dr[slots["Menu Item Price"]]) or 0) for _, dr in rows)
                 if per_row and abs(list(per_row)[0] - abs(vals["Gross Sales Amount"])) > args.tol \
