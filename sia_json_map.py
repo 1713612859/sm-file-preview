@@ -142,10 +142,20 @@ class Event:
         self.items = ot.get("ppos_sales_order_item") or []
         self.pays = ot.get("ppos_sales_order_payment") or []
         rf = ot.get("ppos_sales_order_refund") or []
-        rf0 = rf[0] if isinstance(rf, list) and rf else (rf if isinstance(rf, dict) else None)
-        self.refund_head = rf0 or None
-        self.refund_items = ot.get("ppos_sales_order_refund_item") or []
-        self.refund_amount_c = int(R((rf0 or {}).get("refundAmount") or 0) * 100)
+        self.refund_heads = rf if isinstance(rf, list) else ([rf] if isinstance(rf, dict) else [])
+        # 多次部分退:按事件行级 refund_no(event_key 同源)选本笔;ritem 按
+        # salesOrderRefundId 过滤归属(2026-10-20 订单184 两次退实证)
+        ev_no = str(row.get("refund_no") or "").strip()
+        rh = None
+        if ev_no:
+            rh = next((h for h in self.refund_heads if str(h.get("refundNo") or "").strip() == ev_no), None)
+        if rh is None and self.refund_heads:
+            rh = self.refund_heads[0]
+        self.refund_head = rh
+        rh_id = (rh or {}).get("id")
+        ris_all = ot.get("ppos_sales_order_refund_item") or []
+        self.refund_items = [x for x in ris_all if rh_id is not None and x.get("salesOrderRefundId") == rh_id] if rh_id is not None else ris_all
+        self.refund_amount_c = int(R((self.refund_head or {}).get("refundAmount") or 0) * 100)
         self.kind = row["event_kind"]
         self.month = row["month_key"]
         self.bday = row["business_date"]
@@ -160,7 +170,10 @@ class Event:
         if self.kind == "VOID":
             return "VOID" + self.terminal + str(self.so.get("voidOrderNo") or "").zfill(16)
         if self.kind == "REFUND":
-            return "REFUND" + self.terminal + str(self.so.get("returnOrderNo") or "").zfill(16)
+            # 单号与票面 RETURN# 同源:本笔 refund.refundNo(已按行级 refund_no
+            # 选中),so.returnOrderNo 兜底
+            rf_no = (self.refund_head or {}).get("refundNo")
+            return "REFUND" + self.terminal + str(rf_no or self.so.get("returnOrderNo") or "").zfill(16)
         return "SALE" + self.terminal + self.order_no
 
 
@@ -412,6 +425,25 @@ def main():
                 ev.refund_head and str(ev.refund_head.get("refundType") or "").upper() == "PARTIAL")
             if partial and ev.refund_head:
                 rh = ev.refund_head
+                # 脏行防御(2026-10-20 REFUND005 实证,与 TS 同步):ritem 垃圾 originalPrice
+                # 回链原单;Σ行退款超头 refundAmount 的多余行丢弃(UI 中间态残留)
+                head_pay = R(rh.get("refundAmount"))
+                cum = Z
+                clean, dropped = [], 0
+                for x in ev.refund_items:
+                    amt = R(x.get("refundAmount"))
+                    if clean and cum + amt > head_pay + Decimal('0.01'):
+                        dropped += 1
+                        continue
+                    lid = x.get("salesOrderItemId")
+                    link = next((o for o in orig.items if o.get("id") == lid), None) or                            next((o for o in orig.items if o.get("productName") == x.get("productName")), None)
+                    if link and R(x.get("originalPrice")) < R(x.get("unitPrice")):
+                        x["originalPrice"] = link.get("originalPrice")
+                    clean.append(x)
+                    cum += amt
+                if dropped:
+                    print(f"  [warn] {ev.order_num}: refund_item {dropped} 行超出头退款额 {head_pay:.2f} 被判脏行丢弃")
+                ev.refund_items = clean
                 svc = R(rh.get("serviceCharge"))
                 gross2 = R(R(rh.get("grossSales")) + svc)
                 td2 = R(rh.get("govDiscountAmountNoTax"))
