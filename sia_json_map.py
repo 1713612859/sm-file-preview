@@ -143,6 +143,8 @@ class Event:
         self.pays = ot.get("ppos_sales_order_payment") or []
         rf = ot.get("ppos_sales_order_refund") or []
         rf0 = rf[0] if isinstance(rf, list) and rf else (rf if isinstance(rf, dict) else None)
+        self.refund_head = rf0 or None
+        self.refund_items = ot.get("ppos_sales_order_refund_item") or []
         self.refund_amount_c = int(R((rf0 or {}).get("refundAmount") or 0) * 100)
         self.kind = row["event_kind"]
         self.month = row["month_key"]
@@ -176,7 +178,15 @@ def sale_amounts(ev: Event):
     # TE 口径(2026-10-18 定版:第22列折后):SC/PWD/DIPLOMAT 等政府免税族 Tax=0 时
     # TE=Net(金样例#64=214.29);其余场景(mov>0 或 Tax≠0)用 JSON 头部 vatExemptSales
     # (145/146 与收据票面同值;平单 TE=0 不受影响)
-    te = net if (tax == 0 and lt > 0) else R(so.get("vatExemptSales"))
+    # TE 口径(2026-10-18 折后定版,2026-10-20 扩到混合单):纯 SC/PWD 免税单
+    # (Tax=0)TE=Net;混合单(Tax>0 且 LT>0 且无 MOV)TE=Net−variableSales(免税
+    # 部分折后,A03 平衡,订单172 实证 550≠头部折前 612.50);MOV 单 A03 豁免,
+    # TE 保持头部原值(与票面一致)
+    mov_c0 = R(so.get("naacDiscountAmount")) + R(so.get("movDiscountAmount"))
+    if lt > 0 and mov_c0 == 0:
+        te = net if tax == 0 else R(net - R(so.get("variableSales")))
+    else:
+        te = R(so.get("vatExemptSales"))
     sen = R(so.get("scDiscountAmount"))
     pwd = R(so.get("pwdDiscountAmount"))
     movcol = R(R(so.get("naacDiscountAmount")) + R(so.get("movDiscountAmount")))
@@ -393,12 +403,65 @@ def main():
                 print(f"  [warn] {ev.order_num}: 找不到原单 {ev.order_no},跳过")
                 continue
             am = sale_amounts(orig)
-            # 部分退货门禁(2026-10-20):refund 表金额或自身腿合计 ≠ 原单应付 → 回退 derived
+            # 部分退货门禁(2026-10-20):refund 表金额或自身腿合计 ≠ 原单应付 →
+            # 部分退真值映射(与 TS partialRefundTruth 同口径)
             own_sum = sum(R(p.get("amount")) for p in ev.pays)
             full_by_refund = ev.refund_amount_c == 0 or abs(ev.refund_amount_c - int(am["pay"] * 100)) <= 1
             full_by_legs = not own_sum or abs(own_sum - am["pay"]) <= 0.01
-            if not (full_by_refund and full_by_legs):
-                print(f"  [warn] {ev.order_num}: 部分退货(refund={ev.refund_amount_c/100:.2f}/腿合计={own_sum:.2f} ≠ 原单应付 {am['pay']:.2f}),回退 derived")
+            partial = not (full_by_refund and full_by_legs) or (
+                ev.refund_head and str(ev.refund_head.get("refundType") or "").upper() == "PARTIAL")
+            if partial and ev.refund_head:
+                rh = ev.refund_head
+                svc = R(rh.get("serviceCharge"))
+                gross2 = R(R(rh.get("grossSales")) + svc)
+                td2 = R(rh.get("govDiscountAmountNoTax"))
+                lt2 = R(R(rh.get("lessVatAmount")) - R(rh.get("addVatAmount")))
+                tax2 = sum((R(x.get("vatAmount")) for x in ev.refund_items), Z)
+                pay2 = R(rh.get("refundAmount"))
+                net2 = R(gross2 - tax2 - svc - td2 - lt2)
+                te2 = net2 if (tax2 == 0 and lt2 > 0) else R(rh.get("vatExemptSales"))
+                dc = dict.fromkeys(("ro", "emp", "sen", "vip", "pwd", "mov", "smac", "onl", "sp", "diplo"), Z)
+                for x in ev.refund_items:
+                    t_ = str(x.get("govDiscountType") or "").upper()
+                    a_ = R(x.get("govDiscountAmountNoTax"))
+                    if a_ <= 0: continue
+                    if t_ == "SC": dc["sen"] += a_
+                    elif t_ == "PWD": dc["pwd"] += a_
+                    elif t_ in ("NAAC", "MOV"): dc["mov"] += a_
+                    elif t_ == "SP": dc["sp"] += a_
+                    elif t_ == "DIPLOMATIC": dc["diplo"] += a_
+                    else: dc["ro"] += a_
+                names = {"ro": "Discount"} if dc["ro"] > 0 else {}
+                # ORIGINAL:按原单腿比例分摊(最大腿收尾差)
+                legs2 = []
+                orig_pays = [(resolve_sm_code(p.get("paymentMethod"), p.get("cardType"), p.get("ewalletType")), R(p.get("amount"))) for p in orig.pays]
+                orig_total = sum((a for _, a in orig_pays), Z)
+                if orig_total > 0:
+                    ranked = sorted(orig_pays, key=lambda x: -x[1])[:3]
+                    alloc = Z
+                    for c_, a_ in ranked:
+                        sh = R(pay2 * a_ / orig_total)
+                        legs2.append((c_, sh)); alloc += sh
+                    if legs2: legs2[0] = (legs2[0][0], R(legs2[0][1] + pay2 - alloc))
+                if not legs2: legs2 = [("CSH", pay2)]
+                legs2 = [(c_, -a_) for c_, a_ in legs2]  # PY build_t 负单腿需预取负(TS 由 sgn 翻转)
+                t = build_t(ev, {"gross": gross2, "net": net2, "tax": tax2, "svc": svc, "td": td2, "lt": lt2,
+                                   "te": te2, "pay": pay2, "disc_cols": dc, "disc_names": names}, legs2, {"negative": True})
+                t_rows.append(t)
+                # D 行:refund_item 子集,价含行级 svc
+                grand = pay2
+                for x in ev.refund_items:
+                    svc_i = R(x.get("serviceCharge"))
+                    price = R(R(x.get("unitPrice")) + svc_i)
+                    menu = R(R(x.get("originalPrice")) + svc_i)
+                    lid = x.get("salesOrderItemId")
+                    link = next((o for o in orig.items if o.get("id") == lid), None) or                            next((o for o in orig.items if o.get("productName") == x.get("productName")), None)
+                    sku = x.get("skuCode") or (link or {}).get("skuCode") or ""
+                    d_rows.append([ev.order_num, f"{sku},{x.get('productName') or ''}", "SM", "SM", "SM",
+                                   f"-{max(1, int(x.get('quantity') or 1))}.00", F(price), F(menu),
+                                   x.get("govDiscountType") or "", F(R(menu - price)),
+                                   "", "", "", "", "0", "0.00", "1", F(grand)])
+                print(f"  [warn] {ev.order_num}: 部分退货真值映射(refund={pay2:.2f},原单应付 {am['pay']:.2f})")
                 continue
             sign = -1
             # 负单自身支付表非空则优先(支持退款渠道≠原单),空则镜像原单
