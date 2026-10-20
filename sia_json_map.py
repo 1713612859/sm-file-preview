@@ -141,6 +141,9 @@ class Event:
         self.so = one(ot["ppos_sales_order"])
         self.items = ot.get("ppos_sales_order_item") or []
         self.pays = ot.get("ppos_sales_order_payment") or []
+        rf = ot.get("ppos_sales_order_refund") or []
+        rf0 = rf[0] if isinstance(rf, list) and rf else (rf if isinstance(rf, dict) else None)
+        self.refund_amount_c = int(R((rf0 or {}).get("refundAmount") or 0) * 100)
         self.kind = row["event_kind"]
         self.month = row["month_key"]
         self.bday = row["business_date"]
@@ -390,9 +393,23 @@ def main():
                 print(f"  [warn] {ev.order_num}: 找不到原单 {ev.order_no},跳过")
                 continue
             am = sale_amounts(orig)
+            # 部分退货门禁(2026-10-20):refund 表金额或自身腿合计 ≠ 原单应付 → 回退 derived
+            own_sum = sum(R(p.get("amount")) for p in ev.pays)
+            full_by_refund = ev.refund_amount_c == 0 or abs(ev.refund_amount_c - int(am["pay"] * 100)) <= 1
+            full_by_legs = not own_sum or abs(own_sum - am["pay"]) <= 0.01
+            if not (full_by_refund and full_by_legs):
+                print(f"  [warn] {ev.order_num}: 部分退货(refund={ev.refund_amount_c/100:.2f}/腿合计={own_sum:.2f} ≠ 原单应付 {am['pay']:.2f}),回退 derived")
+                continue
             sign = -1
-            pays = [(resolve_sm_code(p.get("paymentMethod"), p.get("cardType"), p.get("ewalletType")), R(R(p.get("amount")) * sign))
-                    for p in orig.pays]
+            # 负单自身支付表非空则优先(支持退款渠道≠原单),空则镜像原单
+            own = [(resolve_sm_code(p.get("paymentMethod"), p.get("cardType"), p.get("ewalletType")), R(R(p.get("amount")) * -1))
+                   for p in ev.pays]
+            own = [(c, a) for c, a in own if c]
+            if own:
+                pays = own
+            else:
+                pays = [(resolve_sm_code(p.get("paymentMethod"), p.get("cardType"), p.get("ewalletType")), R(R(p.get("amount")) * -1))
+                        for p in orig.pays]
             if not pays:
                 pays = [("CSH", R(-am["pay"]))]
             t = build_t(ev, am, pays, {"negative": True})

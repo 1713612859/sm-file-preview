@@ -665,8 +665,10 @@ def main():
                     ok = False
                     continue
                 total += qq * pp
+            # 2026-10-20 修复:负折扣单 LT/TD 为负值,不取绝对值会把期望抬高
+            # (设备2 VOID 单 TD=-73 实证 expect 198 假红);金样例负单 TD/LT=0 不受影响
             expect = round(abs(vals["Gross Sales Amount"]) - vals["Other/Local Tax"]
-                           - vals["Less Tax Amount"] - vals["Total Discount"], 2)
+                           - abs(vals["Less Tax Amount"]) - abs(vals["Total Discount"]), 2)
             if ok and abs(round(abs(total), 2) - expect) > args.tol:
                 findings.add("D02", tx_name, line=ln, order=o,
                              expected=f"明细 Σ(qty×成交价)={expect:.2f}(|Gross|−LocalTax−LessTax−Discount)",

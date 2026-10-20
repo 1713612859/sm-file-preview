@@ -150,7 +150,11 @@ def classify_tender(raw: str):
         if "JCB" in brand:
             return "jcb"
         return "othercc"
-    if n in ("GCASH", "PAYMAYA", "MAYA", "GRABPAY"):
+    # 2026-10-20 扩:8 渠道统一归 ewallet,与 ppos-app-v2 smPaymentChannels
+    # METHOD_CHANNELS 硬标准对齐(设备 1092334570758208 WECHAT/ALIPAY 实单触发
+    # A07 假红实证);SMAC/MALLPAY*/POINTS 仍归 other
+    if n in ("GCASH", "PAYMAYA", "MAYA", "GRABPAY", "WECHATPAY", "ALIPAY",
+             "QRPH", "QR_PH", "FOODPANDAPAY", "STOREDVALUE", "MEMBERBALANCE", "ONLINE"):
         return "ewallet"
     if n.startswith("MALLPAY") or n in ("SMAC",):
         return "other"
