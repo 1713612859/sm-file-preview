@@ -484,7 +484,12 @@ def main():
         if (mov_disc == 0 or args.mov_caliber == "app") and vals["Total Tax"] != 0:
             vat_expect = round((vals["Net Sales Amount"] - vals["Tax Exempt Sales"]) * 0.12, 2) \
                          + vals["Other/Local Tax"]
-            if abs(vat_expect - vals["Total Tax"]) > max(args.tol, 0.011):
+            # 2026-10-20 修复:先 round 再比较会把真差 0.016(如订单155 净1951.80/TE300
+            # →198.216 vs Tax198.20)抬成 0.02 的浮点边界假红;改比原始差值+epsilon,
+            # 口径不变(容差仍 0.011~0.02,含边界),金样例回归不变
+            vat_raw = (vals["Net Sales Amount"] - vals["Tax Exempt Sales"]) * 0.12 \
+                      + vals["Other/Local Tax"]
+            if abs(vat_raw - vals["Total Tax"]) > max(args.tol, 0.011) + 1e-9:
                 findings.add("A03", tx_name, line=ln, order=o, column="Total Tax",
                              expected=f"≈{vat_expect:.2f}((Net−TaxExempt)×12%+LocalTax)",
                              actual=f"{vals['Total Tax']:.2f}",
