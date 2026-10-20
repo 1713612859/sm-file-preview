@@ -513,14 +513,20 @@ def main():
                 findings.add("A04", tx_name, line=ln, order=o, column="Guest Count (PWD)",
                              expected="≥1", actual=get("Guest Count (PWD)"))
         if mov_disc > 0:
-            expect = round(vals["Gross Sales Amount"] / 1.12 * 0.20, 2)
-            if abs(expect - mov_disc) > args.tol:
-                findings.add("A05" if args.mov_caliber == "golden" else "A05E", tx_name, line=ln, order=o,
-                             column="NationalCoach / Athlete / Medal of Valor Discount amount",
-                             expected=f"≈{expect:.2f}(去税净额×20%)", actual=f"{mov_disc:.2f}",
-                             detail=("金样例S7(=app 实测,EJ 复核):折扣=净额×20%,VAT=折前净额×12%照收,应付=Gross−折扣"
-                                     if args.mov_caliber == "golden" else
-                                     "app 口径(废弃分支):折扣=净额×20%,VAT=折后净额×12%,应付=原价×80%"))
+            # 2026-10-20 多人政府折扣豁免:A05 按单人 MOV 建模(折扣=整单净额×20%),
+            # 多人混合单(SC+NAAC+MOV 各按各自份额折扣)不适用——Sen/PWD 折扣>0
+            # 即判多人单跳过 A05(订单145 三人/146 五人实证);continue 会跳过
+            # 后续 D01 等检查,改为嵌套 if 只跳过 A05 本身
+            multi_gov = vals["Senior Citizen Discount Amount"] > 0 or vals["PWD Discount Amount"] > 0
+            if not multi_gov:
+                expect = round(vals["Gross Sales Amount"] / 1.12 * 0.20, 2)
+                if abs(expect - mov_disc) > args.tol:
+                    findings.add("A05" if args.mov_caliber == "golden" else "A05E", tx_name, line=ln, order=o,
+                                 column="NationalCoach / Athlete / Medal of Valor Discount amount",
+                                 expected=f"≈{expect:.2f}(去税净额×20%)", actual=f"{mov_disc:.2f}",
+                                 detail=("金样例S7(=app 实测,EJ 复核):折扣=净额×20%,VAT=折前净额×12%照收,应付=Gross−折扣"
+                                         if args.mov_caliber == "golden" else
+                                         "app 口径(废弃分支):折扣=净额×20%,VAT=折后净额×12%,应付=原价×80%"))
 
         disc_parts = []
         roa = get("Regular / Other Discount Amount")
