@@ -155,6 +155,11 @@ class Event:
         rh_id = (rh or {}).get("id")
         ris_all = ot.get("ppos_sales_order_refund_item") or []
         self.refund_items = [x for x in ris_all if rh_id is not None and x.get("salesOrderRefundId") == rh_id] if rh_id is not None else ris_all
+        # 多人政府折扣分列真值源(2026-10-21 订单148 REFUND02 实证):与 ritem 同口径
+        # 按本笔 salesOrderRefundId 过滤;ritem.govDiscountType 是聚合标签(多人共享
+        # 行全标 SC),分列必须用 rels.discountType
+        rels_all = ot.get("ppos_refund_gov_person_item_rel") or []
+        self.refund_rels = [x for x in rels_all if rh_id is not None and x.get("salesOrderRefundId") == rh_id] if rh_id is not None else rels_all
         self.refund_amount_c = int(R((self.refund_head or {}).get("refundAmount") or 0) * 100)
         self.kind = row["event_kind"]
         self.month = row["month_key"]
@@ -300,8 +305,11 @@ def build_d(ev: Event, amounts):
         menu = R(it.get("originalPrice") or it.get("unitPrice"))
         rownet = R(it.get("rowNet"))
         svc_i = it.get("serviceCharge")
-        if svc_i is not None:
-            # 行级 svc 加法口径(优先,精确):菜单=rowTotal+行svc、净=rowNet+行svc
+        # 行级 svc 加法口径(优先,精确):菜单=rowTotal+行svc、净=rowNet+行svc。
+        # 条件须 >0(T2 设备行字段 serviceCharge:0 在场——is not None 会误入本支,
+        # 把 menu 从单价 originalPrice 换成行合计 rowTotal,2026-10-21 订单183/145
+        # qty>1 行实证;与 TS rowSvcC=svc>0?:-1 同口径)
+        if svc_i is not None and R(svc_i) > 0:
             menu = R(R(it.get("rowTotal") or menu) + R(svc_i))
             rownet = R(rownet + R(svc_i))
         elif svc_rate > 0:
@@ -343,7 +351,7 @@ def build_d_negative(ev: Event, amounts, orig):
     out = []
     for it in orig.items:
         svc_i = it.get("serviceCharge")
-        if svc_i is not None:
+        if svc_i is not None and R(svc_i) > 0:  # >0 才走行级支(0 在场=无行级 svc,同上)
             menu = R(R(it.get("rowTotal")) + R(svc_i))
             price = R(R(R(it.get("rowNet")) + R(svc_i)) / (it.get("quantity") or 1))
         else:
@@ -468,16 +476,34 @@ def main():
                 net2 = R(gross2 - tax2 - svc - td2 - lt2)
                 te2 = net2 if (tax2 == 0 and lt2 > 0) else R(rh.get("vatExemptSales"))
                 dc = dict.fromkeys(("ro", "emp", "sen", "vip", "pwd", "mov", "smac", "onl", "sp", "diplo"), Z)
-                for x in ev.refund_items:
-                    t_ = str(x.get("govDiscountType") or "").upper()
+                # 2026-10-21 多人政府折扣部分退分列(订单148 REFUND02 实证:SC/PWD/MOV
+                # 三人按件三均分):优先 rels 按 discountType 分列(与 TS foldGovDisc
+                # 同口径);rels 缺失或合计与头 govDiscNoTax 对不上(±0.01)回退 ritem
+                rel_dc = dict.fromkeys(("ro", "emp", "sen", "vip", "pwd", "mov", "smac", "onl", "sp", "diplo"), Z)
+                rel_sum = Z
+
+                def _fold(cols, t_, a_):
+                    if t_ == "SC": cols["sen"] += a_
+                    elif t_ == "PWD": cols["pwd"] += a_
+                    elif t_ in ("NAAC", "MOV"): cols["mov"] += a_
+                    elif t_ == "SP": cols["sp"] += a_
+                    elif t_ == "DIPLOMATIC": cols["diplo"] += a_
+                    else: cols["ro"] += a_
+
+                for x in ev.refund_rels:
                     a_ = R(x.get("govDiscountAmountNoTax"))
                     if a_ <= 0: continue
-                    if t_ == "SC": dc["sen"] += a_
-                    elif t_ == "PWD": dc["pwd"] += a_
-                    elif t_ in ("NAAC", "MOV"): dc["mov"] += a_
-                    elif t_ == "SP": dc["sp"] += a_
-                    elif t_ == "DIPLOMATIC": dc["diplo"] += a_
-                    else: dc["ro"] += a_
+                    _fold(rel_dc, str(x.get("discountType") or "").upper(), a_)
+                    rel_sum += a_
+                if ev.refund_rels and abs(rel_sum - td2) <= Decimal("0.01"):
+                    dc = rel_dc
+                else:
+                    if ev.refund_rels:
+                        print(f"  [warn] {ev.order_num}: 退款折扣 rels 合计 {rel_sum:.2f} ≠ 头 govDiscNoTax {td2:.2f},分列回退 ritem 口径(多人单会全落聚合类型列)")
+                    for x in ev.refund_items:
+                        a_ = R(x.get("govDiscountAmountNoTax"))
+                        if a_ <= 0: continue
+                        _fold(dc, str(x.get("govDiscountType") or "").upper(), a_)
                 names = {"ro": "Discount"} if dc["ro"] > 0 else {}
                 # ORIGINAL:按原单腿比例分摊(最大腿收尾差)
                 legs2 = []
