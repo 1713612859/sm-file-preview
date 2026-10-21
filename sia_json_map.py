@@ -216,7 +216,8 @@ def sale_amounts(ev: Event):
             if key == "onl":
                 names[key] = "Online Deals"  # 金样例 #31 字面量口径,不按率生成
             elif mtype == "percent" and so.get("grossSales"):
-                rate = R(Decimal(str(rest)) / Decimal(str(gross_col)) * 100)
+                pass  # rate 基数=商品额 grossSales(不含 SVC,与 TS 一致;187 实证 95/950=10% 而非含svc 9.57%)
+                rate = R(Decimal(str(rest)) / Decimal(str(gross)) * 100)
                 names[key] = f"{float(rate):g}% Discount"  # %g 防科学计数+去尾零(20 → '20')
             else:
                 names[key] = "Amount Discount" if mtype == "amount" else "Discount"
@@ -298,7 +299,12 @@ def build_d(ev: Event, amounts):
     for it in ev.items:
         menu = R(it.get("originalPrice") or it.get("unitPrice"))
         rownet = R(it.get("rowNet"))
-        if svc_rate > 0:
+        svc_i = it.get("serviceCharge")
+        if svc_i is not None:
+            # 行级 svc 加法口径(优先,精确):菜单=rowTotal+行svc、净=rowNet+行svc
+            menu = R(R(it.get("rowTotal") or menu) + R(svc_i))
+            rownet = R(rownet + R(svc_i))
+        elif svc_rate > 0:
             menu = R(menu * (1 + svc_rate))
             rownet = R(rownet * (1 + svc_rate))
         qty = int(it.get("quantity") or 1)
@@ -330,15 +336,24 @@ def build_d(ev: Event, amounts):
     return out
 
 
-def build_d_negative(ev: Event, amounts):
-    """VOID/REFUND 明细:qty=−1、价格取正(原单价)、整单金额列(D05 样例口径)。"""
+def build_d_negative(ev: Event, amounts, orig):
+    """VOID/全额 REFUND 明细:镜像原单行(成交/原价/口径B 折扣随原单,qty=−原qty,
+    含行级 svc 加法),金额列=整单应付(D05 样例口径)。"""
     grand = R(amounts["pay"])
     out = []
-    for it in ev.items:
-        price = R(it.get("originalPrice") or it.get("unitPrice"))
+    for it in orig.items:
+        svc_i = it.get("serviceCharge")
+        if svc_i is not None:
+            menu = R(R(it.get("rowTotal")) + R(svc_i))
+            price = R(R(R(it.get("rowNet")) + R(svc_i)) / (it.get("quantity") or 1))
+        else:
+            menu = R(it.get("originalPrice") or it.get("unitPrice"))
+            price = R(R(it.get("rowNet")) / (it.get("quantity") or 1)) if it.get("rowNet") else menu
+        qty = f"-{it.get('quantity') or 1}.00"
         row = [
             ev.order_num, f"{it.get('skuCode')},{it.get('productName')}",
-            "SM", "SM", "SM", "-1.00", F(price), F(price), "", "0.00",
+            "SM", "SM", "SM", qty, F(price), F(menu),
+            it.get("govDiscountType") or "", F(R(menu - price)),
             "", "", "", "",
             "1" if ev.kind == "VOID" else "0", F(grand) if ev.kind == "VOID" else "0.00",
             "1" if ev.kind == "REFUND" else "0", F(grand) if ev.kind == "REFUND" else "0.00",
@@ -371,7 +386,7 @@ def self_check(order_num, t, drows, negative=False):
         errs.append(f"A06 分列和{R(sum(parts))}≠TD {g('Total Discount')}")
     total = R(sum((Decimal(dr[5]) * Decimal(dr[6]) for dr in drows), Z))
     expect = R(abs(g("Gross Sales Amount")) - g("Other/Local Tax")
-               - g("Less Tax Amount") - g("Total Discount"))
+               - abs(g("Less Tax Amount")) - abs(g("Total Discount")))
     if abs(abs(total) - expect) > Decimal("0.02"):
         errs.append(f"D02 Σ{abs(total)}≠{expect}")
     for dr in drows:
@@ -508,7 +523,7 @@ def main():
             if not pays:
                 pays = [("CSH", R(-am["pay"]))]
             t = build_t(ev, am, pays, {"negative": True})
-            d = build_d_negative(ev, am)
+            d = build_d_negative(ev, am, orig)
         t_rows.append(t)
         d_rows.extend(d)
         errs = self_check(ev.order_num, t, d)
