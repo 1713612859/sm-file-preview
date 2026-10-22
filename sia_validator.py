@@ -130,16 +130,20 @@ def check_evidence(root: Path, tx_by_order: dict, ix: dict, findings: Findings, 
 
     if or_dir.is_dir():
         files = sorted(or_dir.iterdir())
-        # 2026-10-11 定案(用户指示):APOS-SM 票据文件用 *_T1_Si_单号 命名(Si=Sales
-        # Invoice),按可接受口径处理,OR/Si 两种标识都认;金样例仍为 *_OR_单号。
+        # 命名口径(2026-10-22 复核定版):主路径 {orderId}_{T终端标}_OR_{smSeq}
+        # ——三态(Sale/Voided/Refund)统一 OR 段,#0=smSeq 裸值直显(形如
+        # 56251_T1_OR_2),OR 段数字与 CSV #0 同源,本正则直接命中;
+        # 存量回退 {orderId}_{T}_{Si|Voided|Refund}_{裸16位}(smSeq 缺失老行,
+        # VOID/REFUND 回退标签也认,防 E01 误报缺失);金样例仍为 *_OR_单号。
+        # (2026-10-11 定案 OR/Si 双标识口径保留,Voided/Refund 为 2026-10-22 增补)
         covered = {str(int(m.group(1))) for m in
-                   (re.search(r"(?:\b|[_-])(?:OR|SI)[_-]?(\d+)", f.name, re.I)
+                   (re.search(r"(?:\b|[_-])(?:OR|SI|VOIDED|REFUND)[_-]?(\d+)", f.name, re.I)
                     for f in files) if m}
         for o in tx_by_order:
             if o not in covered and o.lstrip("0") not in covered:
-                # 命名口径同上方 covered 正则:OR/Si 双标识(2026-10-11 定案)
+                # 命名口径同上方 covered 正则:OR/Si 双标识 + 回退三态标签
                 findings.add("E01", "ORs/", order=o,
-                             expected=f"存在 *_OR_{o}.* 或 *_T1_Si_{o}.* 收据",
+                             expected=f"存在 *_OR_{o}.*(主路径 {{orderId}}_T{{n}}_OR_{{smSeq}})或回退 *_Si_{o}.* 收据",
                              actual="未找到(命名不规则或缺失)")
         _check_or_content(files, tx_by_order, findings, tol)
         txt_stems = {f.stem for f in files if f.suffix.lower() == ".txt"}
@@ -169,12 +173,13 @@ def check_evidence(root: Path, tx_by_order: dict, ix: dict, findings: Findings, 
 
 def _check_or_content(files, tx_by_order, findings, tol):
     # 订单号可能带前导零(APOS-SM 为 16 位),按去零归一键匹配,否则内容校验静默跳过;
-    # 金样例短单号("1"/"2"...)不受影响。命名同 E01:OR/Si 双标识(2026-10-11 定案)。
+    # 金样例短单号("1"/"2"...)不受影响。命名同 E01:OR/Si 双标识 + 回退三态标签
+    # (2026-10-22:主路径 {orderId}_T{n}_OR_{smSeq} 三态统一,OR 段与 #0 同源裸值)。
     tx_by_int = {k.lstrip("0"): v for k, v in tx_by_order.items()}
     for f in files:
         if f.suffix.lower() != ".txt":
             continue
-        m = re.search(r"(?:\b|[_-])(?:OR|SI)[_-]?(\d+)", f.name, re.I)
+        m = re.search(r"(?:\b|[_-])(?:OR|SI|VOIDED|REFUND)[_-]?(\d+)", f.name, re.I)
         key = str(int(m.group(1))) if m else None
         t = tx_by_int.get(key) if key else None
         if not t:
@@ -195,30 +200,70 @@ def _check_or_content(files, tx_by_order, findings, tol):
             findings.add("E04", f"ORs/{f.name}", order=m.group(1), column="VAT Amount",
                          expected=f"={abs(vals['Total Tax']):.2f}(CSV Total Tax)", actual=f"{v:.2f}")
         v = num(r"VATable Sales\s+([\d,]+\.\d{2})")
-        if v is not None and vals["Tax Exempt Sales"] == 0 \
-                and abs(v - abs(vals["Net Sales Amount"])) > tol:
-            findings.add("E04", f"ORs/{f.name}", order=m.group(1), column="VATable Sales",
-                         expected=f"={abs(vals['Net Sales Amount']):.2f}(CSV Net Sales)", actual=f"{v:.2f}",
-                         detail="OR 打印的 VATable 与 CSV Net 不一致(疑似模板把 Net−VAT 当 VATable)")
+        if v is not None and vals["Tax Exempt Sales"] == 0:
+            # 2026-10-22 MOV 形态补充(APOS 同源票面实证 12 单,smSeq 直显命名
+            # 使 E04 首次真正匹配到 CSV 单——旧组合号命名一直静默跳过;对照
+            # 产物票面同值,非票面变更):MOV 单票面 VATable=折扣前净额
+            # =Net+MOV折扣额(纯 MOV 单=Gross−TotalTax;混合 LESS 单如 257:
+            # 651.78=530.35+121.43≠Gross−Tax 682.21,故以 Net+MOV 为准)。
+            # 非 MOV 单维持官方样例口径 VATable=Net。
+            mov_col = _ix.get("National Coach / Athlete /  Medal of Valor Discount amount")
+            mov_amt = money(_r[mov_col]) if mov_col is not None else None
+            want = abs(vals["Net Sales Amount"]) + abs(mov_amt) if (mov_amt or 0) > 0 \
+                else abs(vals["Net Sales Amount"])
+            if abs(v - want) > tol:
+                findings.add("E04", f"ORs/{f.name}", order=m.group(1), column="VATable Sales",
+                             expected=f"={want:.2f}({'MOV VAT基数' if (mov_amt or 0) > 0 else 'CSV Net Sales'})",
+                             actual=f"{v:.2f}",
+                             detail="OR 打印的 VATable 与期望不一致(MOV 单按 VAT 基数=Gross−Tax,其余=Net;疑似模板把 Net−VAT 当 VATable)")
 
 
 def _check_zread_content(days, tx_by_order, ix, findings, tol):
     # 四种对账口径:支付合计(含冲抵负单)、全单 Gross 合计(含负)、
     # 正常单 Gross 合计(EJ ZRead 语义:冲抵走 LESS 行,不进 GROSS/BREAKDOWN)、正常单 Tax
+    # 2026-10-22 终端维度:Z-Reading 是每台终端一张(文件名 _T<终端号>_),对账须
+    # 只取该终端的 T 行——同日双终端首次出现(T2+T555 同在 10-22,T555 票 16,089.47
+    # 与自身分组全等却被拿去对全日 22,289.47 误报 E05×2 实证)。
+    # 终端来源优先 Terminal Number 列(2026-10-22 复核定版:#0=smSeq 裸值直显,
+    # 单号不含终端段,终端只能取 #61 列——实测 T2/T555 双终端);组合号形态
+    # SALE/VOID/REFUND+终端号+16 位单号(存量回退)走单号正则;均无法解析的行
+    # (金样例裸序号)回落全日。
+    ORDER_TERM_RX = re.compile(r"^(?:SALE|VOID|REFUND)(\d+?)\d{16}$")
     day_paysum, day_tax, day_gross = defaultdict(float), defaultdict(float), defaultdict(float)
     day_normal_gross, day_normal_tax = defaultdict(float), defaultdict(float)
+    _t61 = ix.get("Terminal Number")
     for _o, (_ln, r, _ix, vals, psum) in tx_by_order.items():
         bd = r[ix["Business Day"]]
-        day_paysum[bd] += psum
-        day_tax[bd] += vals["Total Tax"]
-        day_gross[bd] += vals["Gross Sales Amount"]
+        term61 = None
+        if _t61 is not None:
+            try:
+                term61 = str(int(r[_t61]))
+            except (TypeError, ValueError):
+                term61 = None
+        m = ORDER_TERM_RX.match(_o or "")
+        term_m = (m.group(1).lstrip("0") or "0") if m else None
+        term = term61 or term_m
+        key = (bd, term) if term else (bd, "*")
+        day_paysum[key] += psum
+        day_tax[key] += vals["Total Tax"]
+        day_gross[key] += vals["Gross Sales Amount"]
         if r[_ix["Void"]] != "1" and r[_ix["Refund"]] != "1":
-            day_normal_gross[bd] += vals["Gross Sales Amount"]
-            day_normal_tax[bd] += vals["Total Tax"]
+            day_normal_gross[key] += vals["Gross Sales Amount"]
+            day_normal_tax[key] += vals["Total Tax"]
+
+    def aggr(bd, term):
+        """终端命中则取该终端分组,否则(裸序号/无该终端行)回落全日合计"""
+        keys = [(bd, term)] if day_paysum.get((bd, term)) is not None or term == "*" else []
+        keys.append((bd, "*"))
+        return keys[0]
+
     for bd, fs in days.items():
         txts = [f for f in fs if f.suffix.lower() == ".txt"]
         if not txts:
             continue
+        fm = re.search(r"_Z-Reading_T(\d+)_", txts[0].name)
+        # 终端号 int 归一(与 #61 列/组合号剥出的键同口径,防 "02"/"2" 形态分歧)
+        key = aggr(bd, str(int(fm.group(1)))) if fm else (bd, "*")
         txt = txts[0].read_text(encoding="utf-8", errors="replace")
 
         def znum(pat):
@@ -227,17 +272,19 @@ def _check_zread_content(days, tx_by_order, ix, findings, tol):
 
         gv = znum(r"GROSS AMOUNT:\s+([\d,]+\.\d{2})")
         vv = znum(r"VAT AMOUNT:\s+([\d,]+\.\d{2})")
-        g_ok = [round(x, 2) for x in (day_paysum.get(bd, 0), day_gross.get(bd, 0),
-                                      day_normal_gross.get(bd, 0))]
+        g_ok = [round(x, 2) for x in (day_paysum.get(key, 0), day_gross.get(key, 0),
+                                      day_normal_gross.get(key, 0))]
         if gv is not None and not any(abs(gv - x) <= tol for x in g_ok):
             findings.add("E05", f"ZReads/{txts[0].name}", column="GROSS AMOUNT",
                          expected=f"∈ {g_ok[0]:.2f}(支付合计)/{g_ok[1]:.2f}(Gross)/{g_ok[2]:.2f}(正常单Gross)",
-                         actual=f"{gv:.2f}")
-        v_ok = [round(x, 2) for x in (day_tax.get(bd, 0), day_normal_tax.get(bd, 0))]
+                         actual=f"{gv:.2f}", detail=f"按终端分组 key={key}(文件名 T{fm.group(1) if fm else '?'})"
+                         if fm else "")
+        v_ok = [round(x, 2) for x in (day_tax.get(key, 0), day_normal_tax.get(key, 0))]
         if vv is not None and not any(abs(vv - x) <= tol for x in v_ok):
             findings.add("E05", f"ZReads/{txts[0].name}", column="VAT AMOUNT",
                          expected=f"∈ {v_ok[0]:.2f}(全单Tax)/{v_ok[1]:.2f}(正常单Tax)",
-                         actual=f"{vv:.2f}")
+                         actual=f"{vv:.2f}", detail=f"按终端分组 key={key}(文件名 T{fm.group(1) if fm else '?'})"
+                         if fm else "")
 
 
 # --------------------------------------------------------------------------
@@ -388,6 +435,26 @@ def main():
     if det_header and slots is None:
         findings.add("F03", dt_name, detail="明细表头无法识别为 sample/spec 任一布局,明细字段级检查跳过")
 
+    # 明细行预索引(2026-10-22 A05/A09 豁免判据用;D 族逐行检查仍在后文不变):
+    # A05=单个 MOV/NAAC 人只折自己商品(非整单)时,TD=Σ明细(NAAC/MOV 码)折扣×qty
+    #   即判"明细可解释"跳过整单 20% 判据(订单208: 26.79+35.71+53.57×2+60.00
+    #   =229.64=TD;209/555-13 同构实证);
+    # A09=部分退款 |Gross| 不等于任何整单额,改按明细(商品,单价)子集回链原单
+    #   (REFUND06=SALE239(950) 退 A150+C300=450 实证)
+    det_idx = defaultdict(list)  # order -> [(label, qty, price, code, damt)]
+    if slots is not None:
+        for _ln, _r in dt_rows:
+            if len(_r) != len(det_header):
+                continue
+            _q = money(_r[slots["Item Quantity"]])
+            _p = money(_r[slots["Transaction Item Price"]])
+            _da = money(_r[slots["Discount Amount"]])
+            if _q is None or _p is None or _da is None:
+                continue
+            det_idx[_r[slots["Order Num / Bill Num"]]].append(
+                (f"{_r[slots['Item ID']]},{_r[slots['Item Name']]}", _q, _p,
+                 str(_r[slots["Discount Code"]] or "").strip().upper(), _da))
+
     # ---------------- 主表逐行 ----------------
     ix = {n: i for i, n in enumerate(header)}
     tx_by_order, pos_gross_amounts = {}, []
@@ -518,7 +585,14 @@ def main():
             # 即判多人单跳过 A05(订单145 三人/146 五人实证);continue 会跳过
             # 后续 D01 等检查,改为嵌套 if 只跳过 A05 本身
             multi_gov = vals["Senior Citizen Discount Amount"] > 0 or vals["PWD Discount Amount"] > 0
-            if not multi_gov:
+            # 2026-10-22 明细可解释性豁免(第二轮盲区):单个 MOV/NAAC 人只折自己的
+            # 部分商品时,折扣=被折行去税净额×20%(逐行精确),整单判据必然偏差——
+            # TD 与明细 MOV/NAAC 码行折扣合计(|qty| 加权)一致即判通过
+            # (订单208=229.64/209=185.00/555-13=14.28 三单实证)
+            gov_detail_sum = sum(abs(d[4]) * abs(d[1]) for d in det_idx.get(o, ())
+                                 if d[3] in ("NAAC", "MOV"))
+            detail_ok = abs(round(gov_detail_sum, 2) - mov_disc) <= args.tol
+            if not multi_gov and not detail_ok:
                 expect = round(vals["Gross Sales Amount"] / 1.12 * 0.20, 2)
                 if abs(expect - mov_disc) > args.tol:
                     findings.add("A05" if args.mov_caliber == "golden" else "A05E", tx_name, line=ln, order=o,
@@ -585,14 +659,39 @@ def main():
         tx_by_order[o] = (ln, r, ix, vals, psum)
 
     # A09:退款可对应历史正单
+    # 2026-10-22 部分退感知:部分退款的 |Gross| 是退货商品组合额,不等于任何整单额,
+    # 同额匹配必然落空(REFUND06=SALE239(950) 退 A150+C300=450 首次实证;此前
+    # 300/350/800/650 恰有同额他单碰巧通过)。全额退维持同额匹配;部分退改按
+    # 明细(商品,单价)子集回链——退货行(label,price)能在某正单中找到且数量足够,
+    # 且该正单 Gross ≥ 退款额,即判原单可追溯。
     pos_gross = {round(v, 2) for v in pos_gross_amounts}
+    pos_orders = {}  # order -> (gross, {(label, price): qty})
+    for po, (_pl, _pr, _pix, pvals, _pp) in tx_by_order.items():
+        if pvals["Gross Sales Amount"] > 0 and \
+                _pr[_pix["Void"]] != "1" and _pr[_pix["Refund"]] != "1":
+            bag = defaultdict(float)
+            for d in det_idx.get(po, ()):
+                bag[(d[0], d[2])] += abs(d[1])
+            pos_orders[po] = (pvals["Gross Sales Amount"], bag)
     for o, (ln, r, ix_, vals, psum) in tx_by_order.items():
         refund_flag = r[ix_["Refund"]] if "Refund" in ix_ else "0"
         if refund_flag == "1" or (vals["Refund Amount"] != 0 and vals["Gross Sales Amount"] < 0):
             amt = abs(vals["Gross Sales Amount"])
-            if not any(abs(amt - p) <= args.tol for p in pos_gross):
+            same_amt = any(abs(amt - p) <= args.tol for p in pos_gross)
+            subset_ok = False
+            if not same_amt:
+                need = defaultdict(float)
+                for d in det_idx.get(o, ()):
+                    need[(d[0], d[2])] += abs(d[1])
+                if need:
+                    subset_ok = any(
+                        amt <= pg + args.tol and all(
+                            bag.get(k, 0) >= q - 1e-9 for k, q in need.items())
+                        for pg, bag in pos_orders.values())
+            if not same_amt and not subset_ok:
                 findings.add("A09", tx_name, line=ln, order=o,
-                             expected=f"|Gross|={amt:.2f} 能对应此前某笔同额正销售", actual="历史交易中无同额正单")
+                             expected=f"|Gross|={amt:.2f} 能对应同额正销售或明细可回链原单(部分退)",
+                             actual="历史交易中无同额正单,明细亦无可回链原单")
 
     # F08:文件期号与营业日一致性 + 30 天滚动窗口
     if tx_files and tx_by_order and "Business Day" in ix:
