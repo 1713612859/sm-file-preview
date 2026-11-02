@@ -196,9 +196,12 @@ def _check_or_content(files, tx_by_order, findings, tol):
             findings.add("E04", f"ORs/{f.name}", order=m.group(1), column="Amount Due",
                          expected=f"={abs(psum):.2f}(CSV 支付合计)", actual=f"{v:.2f}")
         v = num(r"VAT Amount \(12%\)\s+([\d,]+\.\d{2})")
-        if v is not None and abs(v - abs(vals["Total Tax"])) > tol:
+        # 2026-11-02 LocalTax 批:票面 VAT excl LT(样例订单214 票面 32.14=
+        # CSV Tax 45.53−LocalTax 13.39 实证;#15 已并入地方税,票面打 VAT 本体)
+        vat_face_expect = abs(vals["Total Tax"] - vals["Other/Local Tax"])
+        if v is not None and abs(v - vat_face_expect) > tol:
             findings.add("E04", f"ORs/{f.name}", order=m.group(1), column="VAT Amount",
-                         expected=f"={abs(vals['Total Tax']):.2f}(CSV Total Tax)", actual=f"{v:.2f}")
+                         expected=f"={vat_face_expect:.2f}(CSV Total Tax−LocalTax)", actual=f"{v:.2f}")
         v = num(r"VATable Sales\s+([\d,]+\.\d{2})")
         if v is not None and vals["Tax Exempt Sales"] == 0:
             # 2026-10-22 MOV 形态补充(APOS 同源票面实证 12 单,smSeq 直显命名
@@ -554,9 +557,18 @@ def main():
             # 2026-10-20 修复:先 round 再比较会把真差 0.016(如订单155 净1951.80/TE300
             # →198.216 vs Tax198.20)抬成 0.02 的浮点边界假红;改比原始差值+epsilon,
             # 口径不变(容差仍 0.011~0.02,含边界),金样例回归不变
+            # 2026-10-24 行数自适应容差:引擎 VAT 逐行取整后求和,本规则聚合式
+            # (Net−TE)×12% 与它的差随行数累加(每行 ≤±0.005)。实测订单430:
+            # 65 应税行 Σround(行毛额×12/112)=15689.12 vs 聚合 15689.1456,
+            # 差 0.0256 > 0.011 固定容差假红(OR 小票自身 VATable×12% 亦≠其
+            # 打印 VAT,属引擎逐行口径非数据错)。容差改 max(tol,0.011,
+            # 0.005+行数×0.001);行数取明细预索引 det_idx,缺明细(=0 行)退回
+            # 固定容差,≤6 行小单不放松
             vat_raw = (vals["Net Sales Amount"] - vals["Tax Exempt Sales"]) * 0.12 \
                       + vals["Other/Local Tax"]
-            if abs(vat_raw - vals["Total Tax"]) > max(args.tol, 0.011) + 1e-9:
+            n_det = len(det_idx.get(o, []))
+            if abs(vat_raw - vals["Total Tax"]) > max(args.tol, 0.011,
+                                                     0.005 + n_det * 0.001) + 1e-9:
                 findings.add("A03", tx_name, line=ln, order=o, column="Total Tax",
                              expected=f"≈{vat_expect:.2f}((Net−TaxExempt)×12%+LocalTax)",
                              actual=f"{vals['Total Tax']:.2f}",
@@ -772,7 +784,9 @@ def main():
                 total += qq * pp
             # 2026-10-20 修复:负折扣单 LT/TD 为负值,不取绝对值会把期望抬高
             # (设备2 VOID 单 TD=-73 实证 expect 198 假红);金样例负单 TD/LT=0 不受影响
-            expect = round(abs(vals["Gross Sales Amount"]) - vals["Other/Local Tax"]
+            # 2026-11-02 LocalTax 批:#16 负单同样取绝对值(LT 退款 −42 曾把期望
+            # 抬高 84:932−(−42)−50=924 vs 实际 840,订单10 实证)
+            expect = round(abs(vals["Gross Sales Amount"]) - abs(vals["Other/Local Tax"])
                            - abs(vals["Less Tax Amount"]) - abs(vals["Total Discount"]), 2)
             if ok and abs(round(abs(total), 2) - expect) > args.tol:
                 findings.add("D02", tx_name, line=ln, order=o,

@@ -9,6 +9,9 @@ sia_json_map.py —— sys_mall_sm_line 的 orderJson(orderTables 真值) → SM
 - 恒等式:A01 Gross=Net+Tax+SVC+Disc+LessTax;A02 支付=Gross−Disc−LessTax;D02/D04 明细口径B
 - Gross 列 = grossSales + serviceCharge(金样例:SVC 单 Menu 价含 svc,Gross 同口径;SVC 单商品价同步上浮)
 - LessTax = lessVatAmount − addVatAmount;TotalDiscount = Gross列 − grandTotal − LessTax(残差,天然满足 A02)
+- LocalTax(2026-11-02 认证样例口径,订单214 等 44 行实证):localTax 并入 #14 Gross
+  与 #15 Total Tax(=vatAmount+localTax),#16 Other/Local Tax 拆出,Net 不含 LT
+  (grandTotal/refundAmount 含 LT、grossSales 不含;与 sm-user smJsonMap.ts 双实现同源)
 - 折扣分列:Senior/PWD 各列;**NAAC+MOV 累加落第29列 National Coach/Athlete/Medal of Valor(2026-10-20 定版,
   列名语义即覆盖两类)**;manual 族按 manualDiscountCategory 落列:VIP/SMAC/EMP/ONLDEAL/REGULAR
 - 负单(VOID/REFUND):原 SALE T 行金额镜像取负 + 独立新单号({KIND}{终端}{序号});明细 qty=−1、价正、
@@ -189,9 +192,13 @@ def sale_amounts(ev: Event):
     svc = R(so.get("serviceCharge"))
     lt = R(R(so.get("lessVatAmount")) - R(so.get("addVatAmount")))
     pay = R(so.get("grandTotal"))
-    gross_col = R(gross + svc)                          # Gross 列 = 含 SVC(金样例口径)
+    # LocalTax(2026-11-02 认证样例口径,订单214 等 44 行实证):localTax 并入
+    # #14 Gross 与 #15 Total Tax,#16 拆出,Net 不含——grandTotal 含 LT、grossSales
+    # 不含,td/net 残差公式随 gross_col 并入自动闭合(A01/A02/A03/D02 全平)
+    local_tax = R(so.get("localTax"))
+    gross_col = R(gross + svc + local_tax)              # Gross 列 = 含 SVC+LT(样例口径)
     td = R(gross_col - pay - lt)                        # 残差(满足 A02)
-    tax = R(so.get("vatAmount"))
+    tax = R(R(so.get("vatAmount")) + local_tax)         # Tax = VAT + LT(样例 A03 同构)
     net = R(gross_col - tax - svc - td - lt)            # A01 残差
     # TE 口径(2026-10-18 定版:第22列折后):SC/PWD/DIPLOMAT 等政府免税族 Tax=0 时
     # TE=Net(金样例#64=214.29);其余场景(mov>0 或 Tax≠0)用 JSON 头部 vatExemptSales
@@ -199,10 +206,10 @@ def sale_amounts(ev: Event):
     # TE 口径(2026-10-18 折后定版,2026-10-20 扩到混合单):纯 SC/PWD 免税单
     # (Tax=0)TE=Net;混合单(Tax>0 且 LT>0 且无 MOV)TE=Net−variableSales(免税
     # 部分折后,A03 平衡,订单172 实证 550≠头部折前 612.50);MOV 单 A03 豁免,
-    # TE 保持头部原值(与票面一致)
+    # TE 保持头部原值(与票面一致)。免税判定看 VAT 本体(tax−local_tax),不含地方税
     mov_c0 = R(so.get("naacDiscountAmount")) + R(so.get("movDiscountAmount"))
     if lt > 0 and mov_c0 == 0:
-        te = net if tax == 0 else R(net - R(so.get("variableSales")))
+        te = net if tax - local_tax == 0 else R(net - R(so.get("variableSales")))
     else:
         te = R(so.get("vatExemptSales"))
     sen = R(so.get("scDiscountAmount"))
@@ -231,6 +238,7 @@ def sale_amounts(ev: Event):
     elif rest < Decimal("-0.005"):
         print(f"  [warn] {ev.order_num}: 政府折扣分列和 {R(sen + pwd + movcol)} > TotalDiscount {td}")
     return {"gross": gross_col, "net": net, "tax": tax, "svc": svc, "td": td, "lt": lt, "te": te,
+            "local_tax": local_tax,
             "pay": pay, "disc_cols": disc_cols, "disc_names": names}
 
 
@@ -266,7 +274,7 @@ def build_t(ev: Event, amounts, pays_money, flags):
         "1" if ev.kind == "VOID" else "0", F(R(v["pay"])) if ev.kind == "VOID" else "0.00",
         "1" if ev.kind == "REFUND" else "0", F(R(-v["pay"])) if ev.kind == "REFUND" else "0.00",
         str(so.get("totalPersons") or 1), str(so.get("scCount") or 0), str(so.get("pwdCount") or 0),
-        F(neg(v["gross"])), F(neg(v["net"])), F(neg(v["tax"])), "0.00",
+        F(neg(v["gross"])), F(neg(v["net"])), F(neg(v["tax"])), F(neg(v["local_tax"])),
         F(neg(v["svc"])), "0.00", F(neg(v["td"])), F(neg(v["lt"])), F(neg(v["te"])),
         dn.get("ro", ""), F(neg(dc["ro"])), F(neg(dc["emp"])), F(neg(dc["sen"])),
         F(neg(dc["vip"])), F(neg(dc["pwd"])), F(neg(dc["mov"])), F(neg(dc["smac"])),
@@ -468,13 +476,16 @@ def main():
                     print(f"  [warn] {ev.order_num}: refund_item {dropped} 行超出头退款额 {head_pay:.2f} 被判脏行丢弃")
                 ev.refund_items = clean
                 svc = R(rh.get("serviceCharge"))
-                gross2 = R(R(rh.get("grossSales")) + svc)
+                # 退款头 LocalTax 同销售侧样例口径(订单10 实证:gross 890+42、
+                # Tax 90+42、refundAmount 882 含 LT,net/td 残差自动闭合)
+                local_tax2 = R(rh.get("localTax"))
+                gross2 = R(R(rh.get("grossSales")) + svc + local_tax2)
                 td2 = R(rh.get("govDiscountAmountNoTax"))
                 lt2 = R(R(rh.get("lessVatAmount")) - R(rh.get("addVatAmount")))
-                tax2 = sum((R(x.get("vatAmount")) for x in ev.refund_items), Z)
+                tax2 = R(sum((R(x.get("vatAmount")) for x in ev.refund_items), Z) + local_tax2)
                 pay2 = R(rh.get("refundAmount"))
                 net2 = R(gross2 - tax2 - svc - td2 - lt2)
-                te2 = net2 if (tax2 == 0 and lt2 > 0) else R(rh.get("vatExemptSales"))
+                te2 = net2 if (tax2 - local_tax2 == 0 and lt2 > 0) else R(rh.get("vatExemptSales"))
                 dc = dict.fromkeys(("ro", "emp", "sen", "vip", "pwd", "mov", "smac", "onl", "sp", "diplo"), Z)
                 # 2026-10-21 多人政府折扣部分退分列(订单148 REFUND02 实证:SC/PWD/MOV
                 # 三人按件三均分):优先 rels 按 discountType 分列(与 TS foldGovDisc
@@ -519,7 +530,8 @@ def main():
                 if not legs2: legs2 = [("CSH", pay2)]
                 legs2 = [(c_, -a_) for c_, a_ in legs2]  # PY build_t 负单腿需预取负(TS 由 sgn 翻转)
                 t = build_t(ev, {"gross": gross2, "net": net2, "tax": tax2, "svc": svc, "td": td2, "lt": lt2,
-                                   "te": te2, "pay": pay2, "disc_cols": dc, "disc_names": names}, legs2, {"negative": True})
+                                   "te": te2, "pay": pay2, "local_tax": local_tax2,
+                                   "disc_cols": dc, "disc_names": names}, legs2, {"negative": True})
                 t_rows.append(t)
                 # D 行:refund_item 子集,价含行级 svc
                 grand = pay2
